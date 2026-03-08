@@ -2,7 +2,7 @@ from fastapi import FastAPI, APIRouter, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine, Column, String, Integer, Float, Boolean, DateTime, Text, ForeignKey
+from sqlalchemy import create_engine, Column, String, Integer, Float, Boolean, DateTime, Text, ForeignKey, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 from sqlalchemy.pool import NullPool
@@ -106,13 +106,14 @@ class MemberModel(Base):
     full_name = Column(String(200), nullable=False)
     email = Column(String(255), nullable=False, index=True)
     phone = Column(String(20), nullable=False)
+    emergency_contact = Column(String(20), nullable=True)  # Emergency contact number
     address = Column(Text, nullable=True)
     date_of_joining = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     membership_plan_id = Column(String(50), ForeignKey("membership_plans.id"), nullable=False)
     membership_start_date = Column(DateTime(timezone=True), nullable=False)
     membership_expiry_date = Column(DateTime(timezone=True), nullable=False)
     trainer_id = Column(String(36), ForeignKey("trainers.id"), nullable=True)
-    status = Column(String(20), default="Active")  # Active, Expired, Suspended
+    status = Column(String(20), default="Active")  # Active, Inactive, Suspended
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 class PaymentModel(Base):
@@ -167,6 +168,7 @@ class MemberCreate(BaseModel):
     full_name: str
     email: EmailStr
     phone: str
+    emergency_contact: Optional[str] = None
     address: Optional[str] = ""
     membership_plan_id: str
     membership_start_date: datetime
@@ -176,6 +178,7 @@ class MemberUpdate(BaseModel):
     full_name: Optional[str] = None
     email: Optional[EmailStr] = None
     phone: Optional[str] = None
+    emergency_contact: Optional[str] = None
     address: Optional[str] = None
     membership_plan_id: Optional[str] = None
     membership_start_date: Optional[datetime] = None
@@ -403,10 +406,35 @@ def get_current_admin_info(admin: AdminModel = Depends(get_current_admin)):
 
 # ===================== ADMIN MEMBER ROUTES =====================
 
+def update_expired_members(db: Session):
+    """Auto-update status to Inactive for expired memberships"""
+    now = datetime.now(timezone.utc)
+    expired_members = db.query(MemberModel).filter(
+        MemberModel.status == "Active",
+        MemberModel.membership_expiry_date < now
+    ).all()
+    for member in expired_members:
+        member.status = "Inactive"
+    if expired_members:
+        db.commit()
+        logger.info(f"Updated {len(expired_members)} members to Inactive status")
+
 @api_router.get("/admin/members")
 def get_members(admin: AdminModel = Depends(get_current_admin), db: Session = Depends(get_db)):
+    # Auto-update expired members
+    update_expired_members(db)
     members = db.query(MemberModel).all()
-    return {"members": [model_to_dict(m) for m in members]}
+    # Add trainer name for each member
+    result = []
+    for m in members:
+        member_dict = model_to_dict(m)
+        if m.trainer_id:
+            trainer = db.query(TrainerModel).filter(TrainerModel.id == m.trainer_id).first()
+            member_dict['trainer_name'] = trainer.name if trainer else None
+        else:
+            member_dict['trainer_name'] = None
+        result.append(member_dict)
+    return {"members": result}
 
 @api_router.get("/admin/members/{member_id}")
 def get_member(member_id: str, admin: AdminModel = Depends(get_current_admin), db: Session = Depends(get_db)):
@@ -428,6 +456,7 @@ def create_member(member_data: MemberCreate, admin: AdminModel = Depends(get_cur
         full_name=member_data.full_name,
         email=member_data.email,
         phone=member_data.phone,
+        emergency_contact=member_data.emergency_contact,
         address=member_data.address or "",
         membership_plan_id=member_data.membership_plan_id,
         membership_start_date=member_data.membership_start_date,
@@ -470,6 +499,10 @@ def delete_member(member_id: str, admin: AdminModel = Depends(get_current_admin)
     member = db.query(MemberModel).filter(MemberModel.id == member_id).first()
     if not member:
         raise HTTPException(status_code=404, detail="Member not found")
+    
+    # Delete associated payments first (handle foreign key constraint)
+    db.query(PaymentModel).filter(PaymentModel.member_id == member_id).delete()
+    
     db.delete(member)
     db.commit()
     return {"message": "Member deleted successfully"}
@@ -506,6 +539,59 @@ def record_manual_payment(
     db.refresh(payment)
     
     return {"payment": model_to_dict(payment), "message": "Payment recorded successfully"}
+
+class RenewMembershipRequest(BaseModel):
+    member_id: str
+    duration_months: int = 1
+    amount: float
+    payment_method: str
+
+@api_router.post("/admin/members/renew")
+def renew_membership(
+    request: RenewMembershipRequest,
+    admin: AdminModel = Depends(get_current_admin),
+    db: Session = Depends(get_db)
+):
+    """Renew membership for 1 month (or specified duration) and record payment"""
+    member = db.query(MemberModel).filter(MemberModel.id == request.member_id).first()
+    if not member:
+        raise HTTPException(status_code=404, detail="Member not found")
+    
+    now = datetime.now(timezone.utc)
+    
+    # Calculate new start and expiry dates
+    # If expired, start from today; if active, extend from current expiry
+    if member.membership_expiry_date < now:
+        new_start = now
+    else:
+        new_start = member.membership_expiry_date
+    
+    new_expiry = new_start + timedelta(days=request.duration_months * 30)
+    
+    # Update member
+    member.membership_start_date = new_start
+    member.membership_expiry_date = new_expiry
+    member.status = "Active"
+    
+    # Record payment
+    payment = PaymentModel(
+        member_id=request.member_id,
+        order_id=f"RENEW-{uuid.uuid4().hex[:8].upper()}",
+        amount=request.amount,
+        payment_method=request.payment_method,
+        payment_date=now,
+        status="PAID"
+    )
+    db.add(payment)
+    db.commit()
+    db.refresh(member)
+    db.refresh(payment)
+    
+    return {
+        "member": model_to_dict(member),
+        "payment": model_to_dict(payment),
+        "message": f"Membership renewed for {request.duration_months} month(s)"
+    }
 
 # ===================== CASHFREE PAYMENT ROUTES =====================
 
@@ -638,13 +724,20 @@ async def payment_webhook(request: dict, db: Session = Depends(get_db)):
 def get_dashboard_stats(admin: AdminModel = Depends(get_current_admin), db: Session = Depends(get_db)):
     now = datetime.now(timezone.utc)
     
+    # Update expired members status
+    update_expired_members(db)
+    
     total_members = db.query(MemberModel).count()
     active_members = db.query(MemberModel).filter(MemberModel.status == "Active").count()
-    expired_members = db.query(MemberModel).filter(MemberModel.status == "Expired").count()
+    inactive_members = db.query(MemberModel).filter(MemberModel.status.in_(["Inactive", "Expired"])).count()
     
-    # Monthly revenue
-    paid_payments = db.query(PaymentModel).filter(PaymentModel.status == "PAID").all()
-    monthly_revenue = sum(p.amount for p in paid_payments)
+    # Current month revenue - calculate based on current month's payments
+    start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    current_month_payments = db.query(PaymentModel).filter(
+        PaymentModel.status == "PAID",
+        PaymentModel.payment_date >= start_of_month
+    ).all()
+    monthly_revenue = sum(p.amount for p in current_month_payments if p.amount)
     
     # Upcoming renewals (next 7 days)
     next_week = now + timedelta(days=7)
@@ -663,17 +756,32 @@ def get_dashboard_stats(admin: AdminModel = Depends(get_current_admin), db: Sess
         payment_dict['member_name'] = member.full_name if member else "Unknown"
         recent_payments_list.append(payment_dict)
     
-    # Revenue by month (last 6 months)
+    # Revenue by month (last 6 months) - actual calculation per month
     revenue_by_month = []
     for i in range(5, -1, -1):
-        month_date = now - timedelta(days=30*i)
-        month_name = month_date.strftime("%b")
-        revenue_by_month.append({"month": month_name, "revenue": monthly_revenue / 6 if i == 0 else monthly_revenue / 8})
+        # Calculate start and end of each month
+        target_date = now - timedelta(days=30*i)
+        month_start = target_date.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if target_date.month == 12:
+            month_end = month_start.replace(year=target_date.year + 1, month=1)
+        else:
+            month_end = month_start.replace(month=target_date.month + 1)
+        
+        # Get payments for this month
+        month_payments = db.query(PaymentModel).filter(
+            PaymentModel.status == "PAID",
+            PaymentModel.payment_date >= month_start,
+            PaymentModel.payment_date < month_end
+        ).all()
+        
+        month_revenue = sum(p.amount for p in month_payments if p.amount)
+        month_name = month_start.strftime("%b")
+        revenue_by_month.append({"month": month_name, "revenue": month_revenue})
     
     return {
         "total_members": total_members,
         "active_members": active_members,
-        "expired_members": expired_members,
+        "inactive_members": inactive_members,
         "monthly_revenue": monthly_revenue,
         "upcoming_renewals": upcoming_renewals,
         "recent_payments": recent_payments_list,
@@ -718,15 +826,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def run_migrations(db: Session):
+    """Run database migrations for new columns"""
+    try:
+        # Check if emergency_contact column exists
+        result = db.execute(text("""
+            SELECT column_name FROM information_schema.columns 
+            WHERE table_name='members' AND column_name='emergency_contact'
+        """))
+        if not result.fetchone():
+            db.execute(text("ALTER TABLE members ADD COLUMN emergency_contact VARCHAR(20)"))
+            db.commit()
+            logger.info("Added emergency_contact column to members table")
+    except Exception as e:
+        logger.warning(f"Migration check: {str(e)}")
+        db.rollback()
+
 @app.on_event("startup")
 def startup_event():
     # Create tables
     Base.metadata.create_all(bind=engine)
     logger.info("Database tables created")
     
-    # Seed initial data
+    # Run migrations
     db = SessionLocal()
     try:
+        run_migrations(db)
         seed_initial_data(db)
     finally:
         db.close()
